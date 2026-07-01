@@ -90,7 +90,6 @@ export default function App() {
   const [authModalType, setAuthModalType] = useState<'login' | 'signup' | null>(null);
   const [bookingClinic, setBookingClinic] = useState<VetClinic | null>(null);
   const [reviewsClinic, setReviewsClinic] = useState<VetClinic | null>(null);
-  const [showVetRegisterModal, setShowVetRegisterModal] = useState<boolean>(false);
 
   // Search & Filtration States
   const [searchName, setSearchName] = useState<string>('');
@@ -205,7 +204,11 @@ export default function App() {
     if (user.role === 'admin') {
       setActiveTab('admin_dashboard');
     } else if (user.role === 'veterinarian') {
-      setActiveTab('vet_dashboard');
+      if (!user.clinicId) {
+        setActiveTab('vet_register');
+      } else {
+        setActiveTab('vet_dashboard');
+      }
     } else {
       setActiveTab('user_dashboard');
     }
@@ -288,7 +291,21 @@ export default function App() {
       const updatedUser = { ...currentUser, clinicId: createdClinic.id };
       setCurrentUser(updatedUser);
       localStorage.setItem(STORAGE_KEY_USER, JSON.stringify(updatedUser));
+      setActiveTab('vet_dashboard');
     }
+  };
+
+  const handleUpdateClinicVerification = async (clinicId: string, status: VetClinic['verificationStatus'] | 'suspended') => {
+    const res = await authFetch(`/api/clinics/${clinicId}/verification`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    });
+    if (res.status === 401 || res.status === 403) {
+      handleForceLogout();
+      return;
+    }
+    if (!res.ok) console.error('Failed to update verification status');
+    await pullConfiguration();
   };
 
 
@@ -322,7 +339,8 @@ export default function App() {
 
 
   // ===== Clinic Filtering Logic =====
-  const filteredClinics = clinics.filter((clinic) => {
+  const publicClinics = clinics.filter((clinic) => clinic.verificationStatus === 'approved');
+  const filteredClinics = publicClinics.filter((clinic) => {
     if (searchName && !clinic.name.toLowerCase().includes(searchName.toLowerCase())) return false;
     if (searchArea && !clinic.area.toLowerCase().includes(searchArea.toLowerCase())) return false;
     if (filterOpenNow && !clinic.isOpenNow) return false;
@@ -355,7 +373,7 @@ export default function App() {
         {activeTab === 'home' && (
           <motion.div key="home" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex-grow">
             <Hero
-              clinics={clinics.slice(0, 5)}
+              clinics={publicClinics.slice(0, 5)}
               userLocation={userLocation}
               onSelectClinic={(id) => { setSelectedClinicId(id); setActiveTab('find_vets'); }}
               onNavigateToFind={() => setActiveTab('find_vets')}
@@ -583,7 +601,7 @@ export default function App() {
                 <h3 className="font-display font-black text-2xl sm:text-3xl tracking-normal">Are You a Practicing Veterinarian?</h3>
                 <p className="text-white/80 text-xs sm:text-sm max-w-xl mx-auto leading-relaxed">Join our verified directory network. Put your animal hospital or private consultancy on the interactive maps.</p>
                 <div className="pt-2">
-                  <button onClick={() => setShowVetRegisterModal(true)}
+                  <button onClick={() => setActiveTab('vet_register')}
                     className="px-8 py-3.5 bg-white text-green-700 font-extrabold rounded-2xl shadow-lg active:scale-95 transition-all text-sm cursor-pointer select-none">
                     Register Your Clinic Station
                   </button>
@@ -685,7 +703,7 @@ export default function App() {
               <p className="text-gray-500 text-xs sm:text-sm">Real stories from local companion pet parents in India.</p>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {clinics.map(clinic => (
+              {publicClinics.map(clinic => (
                 <div key={clinic.id} className="p-5 bg-white border border-gray-100 rounded-3xl space-y-3 shadow-sm hover:border-[#58B368]/40 transition-colors">
                   <div className="flex justify-between items-start">
                     <div>
@@ -773,6 +791,7 @@ export default function App() {
                 clinics={clinics}
                 bookings={bookings}
                 emergencies={emergencies}
+                onUpdateClinicVerification={handleUpdateClinicVerification}
               />
             </motion.div>
           ) : (
@@ -814,9 +833,6 @@ export default function App() {
       {reviewsClinic && (
         <ReviewsModal clinic={reviewsClinic} currentUser={currentUser} onClose={() => setReviewsClinic(null)}
           onOpenAuth={(type) => setAuthModalType(type)} />
-      )}
-      {showVetRegisterModal && (
-        <VetRegistrationModal onClose={() => setShowVetRegisterModal(false)} onSubmitRegistration={handleSubmitVetRegistration} />
       )}
     </div>
   );

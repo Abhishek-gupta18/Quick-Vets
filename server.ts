@@ -11,6 +11,7 @@ import {
 } from './src/server/schema.js';
 import { signToken } from './src/server/jwt.js';
 import { authenticateToken, requireRole } from './src/server/middleware.js';
+import { getAdminAnalytics, getUserAnalytics, getVetAnalytics } from './src/server/analytics.js';
 
 const app = express();
 const PORT = 3000;
@@ -60,6 +61,14 @@ function getJwtSecret(): string {
   return secret;
 }
 
+function getSessionExpiryForRole(role: string): number | undefined {
+  if (role === 'pet_owner') {
+    return 30 * 60;
+  }
+
+  return undefined;
+}
+
 function getISTTime(): string {
   return new Date().toLocaleTimeString('en-IN', {
     hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata'
@@ -78,17 +87,13 @@ function getISTDate(): string {
 // AUTH: Sign Up
 app.post('/api/auth/signup', async (req, res) => {
   try {
-    const { email, name, password, role, phone, clinicId } = req.body;
+    const { email, name, password, role, phone } = req.body;
     if (!email || !name || !password || !role) {
       return res.status(400).json({ error: 'Missing required signup parameters.' });
     }
     if (!['pet_owner', 'veterinarian'].includes(role)) {
       return res.status(400).json({ error: 'Unsupported signup role.' });
     }
-    if (role === 'veterinarian' && !clinicId) {
-      return res.status(400).json({ error: 'Clinic ID is required for veterinarian signups.' });
-    }
-
     const normalizedEmail = normalizeEmail(email);
     const existing = await db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1);
     if (existing.length > 0) {
@@ -102,12 +107,13 @@ app.post('/api/auth/signup', async (req, res) => {
     const [newUser] = await db.insert(users).values({
       id, email: normalizedEmail, passwordHash, name, role,
       phone: phone || '', avatarUrl,
-      clinicId: role === 'veterinarian' ? clinicId : null,
+      clinicId: null,
     }).returning();
 
     const token = signToken(
       { id: newUser.id, email: normalizedEmail, role: newUser.role, clinicId: newUser.clinicId || undefined },
-      getJwtSecret()
+      getJwtSecret(),
+      getSessionExpiryForRole(newUser.role)
     );
 
     // Build user response (exclude passwordHash)
@@ -141,7 +147,8 @@ app.post('/api/auth/login', async (req, res) => {
 
     const token = signToken(
       { id: user.id, email: normalizedEmail, role: user.role, clinicId: user.clinicId || undefined },
-      getJwtSecret()
+      getJwtSecret(),
+      getSessionExpiryForRole(user.role)
     );
 
     const userResponse = await buildUserResponse(user.id);
@@ -238,6 +245,9 @@ app.post('/api/clinics', authenticateToken, async (req: any, res: any) => {
     if (!name || !address || !area || !phone) {
       return res.status(400).json({ error: 'Missing key details (Name, Address, Area, Phone).' });
     }
+    if (!['veterinarian', 'admin'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Only veterinarians can submit professional verification profiles.' });
+    }
 
     const id = `clinic-${Date.now()}`;
     const [newClinic] = await db.insert(vetClinics).values({
@@ -261,6 +271,10 @@ app.post('/api/clinics', authenticateToken, async (req: any, res: any) => {
       yearsOfExperience: yearsOfExperience || '',
     }).returning();
 
+    if (req.user.role === 'veterinarian') {
+      await db.update(users).set({ clinicId: newClinic.id }).where(eq(users.id, req.user.id));
+    }
+
     res.status(201).json({
       ...newClinic,
       rating: parseFloat(newClinic.rating || '5'),
@@ -274,6 +288,38 @@ app.post('/api/clinics', authenticateToken, async (req: any, res: any) => {
   } catch (err: any) {
     console.error('Create clinic error:', err);
     res.status(500).json({ error: 'Failed to create clinic.' });
+  }
+});
+
+// CLINICS: Update verification status (admin only)
+app.post('/api/clinics/:id/verification', authenticateToken, requireRole('admin'), async (req: any, res: any) => {
+  try {
+    const { status } = req.body;
+    const allowedStatuses = ['pending', 'approved', 'rejected', 'needs_documents', 'hold', 'suspended'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Unsupported verification status.' });
+    }
+
+    const [updated] = await db.update(vetClinics)
+      .set({ verificationStatus: status })
+      .where(eq(vetClinics.id, req.params.id))
+      .returning();
+
+    if (!updated) return res.status(404).json({ error: 'Clinic verification profile not found.' });
+
+    res.json({
+      ...updated,
+      rating: parseFloat(updated.rating || '0'),
+      reviewsCount: updated.reviewsCount || 0,
+      verificationDocuments: updated.verificationDocuments || [],
+      verificationStatus: updated.verificationStatus || status,
+      licenseNumber: updated.licenseNumber || '',
+      veterinarianName: updated.veterinarianName || '',
+      yearsOfExperience: updated.yearsOfExperience || '',
+    });
+  } catch (err: any) {
+    console.error('Update clinic verification error:', err);
+    res.status(500).json({ error: 'Failed to update verification status.' });
   }
 });
 
@@ -584,6 +630,39 @@ app.get('/api/user/me', authenticateToken, async (req: any, res: any) => {
   } catch (err: any) {
     console.error('Get user error:', err);
     res.status(500).json({ error: 'Failed to fetch user.' });
+  }
+});
+
+// ANALYTICS: Admin dashboard
+app.get('/api/analytics/admin', authenticateToken, requireRole('admin'), async (_req: any, res: any) => {
+  try {
+    res.json(await getAdminAnalytics());
+  } catch (err: any) {
+    console.error('Admin analytics error:', err);
+    res.status(500).json({ error: 'Failed to fetch admin analytics.' });
+  }
+});
+
+// ANALYTICS: Veterinarian dashboard
+app.get('/api/analytics/vet', authenticateToken, requireRole('veterinarian'), async (req: any, res: any) => {
+  try {
+    if (!req.user.clinicId) {
+      return res.status(400).json({ error: 'Veterinarian profile is not linked to a clinic yet.' });
+    }
+    res.json(await getVetAnalytics(req.user.clinicId));
+  } catch (err: any) {
+    console.error('Vet analytics error:', err);
+    res.status(500).json({ error: 'Failed to fetch veterinarian analytics.' });
+  }
+});
+
+// ANALYTICS: Pet owner dashboard
+app.get('/api/analytics/user', authenticateToken, requireRole('pet_owner'), async (req: any, res: any) => {
+  try {
+    res.json(await getUserAnalytics(req.user.id));
+  } catch (err: any) {
+    console.error('User analytics error:', err);
+    res.status(500).json({ error: 'Failed to fetch user analytics.' });
   }
 });
 
